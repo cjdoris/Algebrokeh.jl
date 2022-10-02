@@ -31,3 +31,5 @@ gd = combine(groupby(d, :name), d->(time=[d.time], value=[d.value]))
  * mapping(x="time", y="value", color="name", text="name")
 ) |> draw |> display
 ```
+
+![Example plot](https://raw.githubusercontent.com/cjdoris/Algebrokeh.jl/main/example.png)
