@@ -1,0 +1,7 @@
+name = "Algebrokeh"
+uuid = "4bcfeb0e-dace-4776-85d1-1f75910a672a"
+authors = ["Christopher Doris <github.com/cjdoris>"]
+version = "0.1.0"
+
+[deps]
+Bokeh = "c4b4474d-016b-471b-b14f-576041b951ff"
