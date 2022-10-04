@@ -124,6 +124,7 @@ end
 Base.@kwdef mutable struct Mapping
     literal::Any = nothing
     field::Union{String,Nothing} = nothing
+    transforms::Vector{Bokeh.ModelInstance} = Bokeh.ModelInstance[]
     label::Any = nothing
     datatype::Union{String,Nothing} = nothing  # number or factor
     factors::Union{Vector{Any},Nothing} = nothing
@@ -146,6 +147,10 @@ function mapping!(m::Mapping, x)
         elseif x.second isa AbstractString || Bokeh.ismodelinstance(x.second, Bokeh.BaseText)
             mapping!(m, x.first)
             m.label = x.second
+            return
+        elseif Bokeh.ismodelinstance(x.second, Bokeh.Transform)
+            mapping!(m, x.first)
+            push!(m.transforms, x.second)
             return
         end
     end
@@ -183,24 +188,33 @@ function Mapping(k::Symbol, v::Any; source, theme)
             column = source.data[m.field]
             m.factors = sort(unique(column))
         end
+        transforms = copy(m.transforms)
         if m.mappingtype == "data"
-            m.literal = Bokeh.Field(m.field)
+            # nothing to do
         elseif m.mappingtype == "color"
             if m.datatype == "number"
-                m.literal = Bokeh.linear_cmap(m.field, get_palette(theme.continuous_palette))
+                push!(transforms, Bokeh.LinearColorMapper(; palette=get_palette(theme.continuous_palette)))
             elseif m.datatype == "factor"
-                m.literal = Bokeh.factor_cmap(m.field, get_palette(theme.categorical_palette, length(m.factors)), m.factors)
+                push!(transforms, Bokeh.CategoricalColorMapper(; palette=get_palette(theme.categorical_palette, length(m.factors)), factors=m.factors))
             else
                 error("unknown datatype: $(m.datatype)")
             end
         elseif m.mappingtype == "marker"
             if m.datatype == "factor"
-                m.literal = Bokeh.factor_mark(m.field, get_markers(theme.markers, length(m.factors)), m.factors)
+                push!(transforms, Bokeh.CategoricalMarkerMapper(; markers=get_markers(theme.markers, length(m.factors)), factors=m.factors))
             else
                 error("marker mapping must be categorical")
             end
         else
             error("unknown mappingtype: $(m.datatype)")
+        end
+        if isempty(transforms)
+            m.literal = Bokeh.Field(m.field)
+        elseif length(transforms) == 1
+            m.literal = Bokeh.transform(m.field, transforms[1])
+        else
+            # TODO: https://stackoverflow.com/questions/48772907/layering-or-nesting-multiple-bokeh-transforms
+            error("not implemented: multiple transforms (on mapping $mappingname)")
         end
     end
     return m
