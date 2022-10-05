@@ -15,21 +15,14 @@ Bokeh.settings!(display=:browser)
 Random.seed!(1234)
 d = DataFrame(name = repeat(["A","B","C","D","E","F"], inner=4), time=repeat([0,1,3,6], outer=6), value = rand(24))
 
-# You cannot use the `Line` glyph with the `color` mapping.
-# For now you must explicitly group the data and use the `MultiLine` glyph - this will be
-# handled automatically in the future.
-gd = combine(groupby(d, :name), d->(time=[d.time], value=[d.value]))
+# Create a simple scatter plot. It is automatically displayed at the REPL or in a notebook.
+# From a function, call `display` on the result to show it.
+plot(d, Scatter, x="@time", y="@value", color="@name")
 
-# Create an Algebrokeh plot:
-# - `data()` specifies a data source
-# - `visual()` specifies a glyph to draw
-# - `mapping()` specifies the mappings of glyph properties to data
-# - `*` combines layers into one, to specify a combination of data, glyphs and mappings
-# - `+` stacks layers on top of each other
-# Then convert it to a Bokeh plot (with `draw`) and display it.
-((data(d) * (visual(Scatter) + visual(Bokeh.Text)) + data(gd) * visual(MultiLine))
- * mapping(x="time", y="value", color="name", text="name")
-) |> draw |> display
+# A more complex example which uses several different glyphs: `Scatter`, `Text` and
+# `MultiLine`. The `Line` glyph does not allow `color` to be a mapping, so the `linesby()`
+# function reshapes the data into the format expected by `MultiLine`.
+plot(d, x="@time", y="@value", color="@name", text="@name") * (plot(Scatter) + plot(Bokeh.Text) + linesby("name"))
 ```
 
 ![Example plot](https://raw.githubusercontent.com/cjdoris/Algebrokeh.jl/main/example.png)
