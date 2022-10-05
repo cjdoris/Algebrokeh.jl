@@ -1,33 +1,54 @@
 module Algebrokeh
 
 import Bokeh
+import DataFrames: DataFrame, groupby, combine, nrow
+import Tables
 
-export data, visual, mapping, vstack, hstack, draw!, draw
+export plot, vstack, hstack
 
 
 ### LAYER
 
 Base.@kwdef struct Layer
     data::Any=nothing
+    transforms::Vector{Any}=[]
     glyph::Union{Bokeh.ModelType,Nothing}=nothing
-    mappings::Dict{Symbol,Any} = Dict{Symbol,Any}()
     properties::Dict{Symbol,Any} = Dict{Symbol,Any}()
 end
 
-data(data) = Layer(; data)
-visual(glyph::Bokeh.ModelType; kw...) = Layer(; glyph, properties=Dict{Symbol,Any}(kw))
-visual(; kw...) = Layer(; properties=Dict{Symbol,Any}(kw))
-visual(glyphs::Bokeh.ModelType...; kw...) = Layers([visual(glyph; kw...) for glyph in glyphs])
-mapping(; kw...) = Layer(; mappings=Dict{Symbol,Any}(kw))
-mapping(x; kw...) = mapping(; x, kw...)
-mapping(x, y; kw...) = mapping(; x, y, kw...)
+function plot(args...; kw...)
+    data = nothing
+    glyphs = Bokeh.ModelType[]
+    transforms = []
+    properties = Dict{Symbol,Any}(kw)
+    for arg in args
+        if Tables.istable(arg) || Bokeh.ismodelinstance(arg, Bokeh.DataSource)
+            if data === nothing
+                data = arg
+            else
+                error("cannot specify multiple data sources")
+            end
+        elseif isa(arg, Bokeh.ModelType) && Bokeh.issubmodeltype(arg, Bokeh.Glyph)
+            push!(glyphs, arg)
+        elseif isa(arg, Function)
+            push!(transforms, arg)
+        else
+            error("unexpected argument of type $(typeof(arg))")
+        end
+    end
+    ans = Layers([Layer(; data, transforms, properties)])
+    if !isempty(glyphs)
+        ans *= Layers([Layer(; glyph) for glyph in glyphs])
+    end
+    return ans
+end
 
 function Base.:(*)(x::Layer, y::Layer)
     data = y.data !== nothing ? y.data : x.data
     glyph = y.glyph !== nothing ? y.glyph : x.glyph
-    mappings = merge(x.mappings, y.mappings)
     properties = merge(x.properties, y.properties)
-    return Layer(; data, glyph, mappings, properties)
+    transforms = vcat(x.transforms, y.transforms)
+    return Layer(; data, glyph, properties, transforms)
 end
 
 
@@ -60,6 +81,8 @@ Base.@kwdef mutable struct Theme
     continuous_palette::Any = "Viridis"
     categorical_palette::Any = "Dark2"
     markers::Any = ["circle", "square", "triangle"]
+    legend_location::String = "right"
+    figure_opts::NamedTuple = NamedTuple()
 end
 
 function get_palette(p, n=nothing)
@@ -132,10 +155,22 @@ Base.@kwdef mutable struct Mapping
     mappingtype::Union{String,Nothing} = nothing
 end
 
+function is_mapping(x)
+    @nospecialize
+    if x isa AbstractString
+        return startswith(x, '@')
+    elseif x isa Pair
+        return is_mapping(x.first)
+    else
+        return x isa Bokeh.Value || x isa Bokeh.Field || x isa Bokeh.Expr
+    end
+end
+
 function mapping!(m::Mapping, x)
     @nospecialize
     if x isa AbstractString
-        m.field = x
+        startswith(x, '@') || error("mapping field should start with '@'")
+        m.field = String(x)[2:end]
         return
     elseif x isa Bokeh.Value || x isa Bokeh.Field || x isa Bokeh.Expr
         m.literal = x
@@ -224,20 +259,24 @@ end
 # ### VSTACK
 
 function stack(k1, k2, fields; kw...)
+    haskey(kw, k1) && error("invalid argument $k1")
+    haskey(kw, k2) && error("invalid argument $k2")
     fields = collect(String, fields)
     layers = Layer[]
     x1 = Bokeh.Expr(Bokeh.Stack(fields=[]))
     for i in 1:length(fields)
         x2 = Bokeh.Expr(Bokeh.Stack(fields=fields[1:i]))
-        kwnew = Dict{Symbol,Any}()
+        properties = Dict{Symbol,Any}()
         for (k, v) in kw
             if v isa AbstractVector
-                kwnew[k] = v[i]
+                properties[k] = v[i]
             else
-                kwnew[k] = v
+                properties[k] = v
             end
         end
-        layer = Layer(mappings=Dict(k1=>x1, k2=>x2), properties=kwnew)
+        properties[k1] = x1
+        properties[k2] = x2
+        layer = Layer(; properties)
         push!(layers, layer)
         x1 = x2
     end
@@ -255,71 +294,58 @@ end
 
 ### DRAW
 
-function _is_dataspec(m, k)
-    d = get(m.propdescs, k, nothing)
-    return d !== nothing && d.kind == Bokeh.TYPE_K && d.type.prim == Bokeh.DATASPEC_T
-end
-
-function _glyph_to_multiglyph(glyph, multiglyph, source, mappings)
-    dataspec_mappings = Dict(
-        k => v
-        for (k, v) in mappings
-        if k == :color || (haskey(glyph.propdescs, k) && !_is_dataspec(glyph, k) && _is_dataspec(multiglyph, k))
-    )
-    if isempty(dataspec_mappings)
-        return (glyph, source, mappings)
-    end
-    if Bokeh.ismodelinstance(source, Bokeh.ColumnDataSource)
-        # create a new data source by grouping on each mapping (which must be categorical)
-        # and collecting all other columns into a vector
-        # TODO: some mappings may need to be renamed, e.g. x -> xs.
-        for (k, v) in dataspec_mappings
-            @assert v.datatype !== nothing
-            @assert v.field !== nothing
-            v.datatype == "factor" || error("$(glyph.name) only supports categorical mappings, but $k has type $(v.datatype)")
-        end
-        factor_fields = String[v.field for v in values(dataspec_mappings)]
-        other_fields = String[k for k in keys(source.data) if k ∉ factor_fields]
-        data = source.data
-        datalen = maximum(length, values(data))
-        factor_cols = [data[k] for k in factor_fields]
-        other_cols = [data[k] for k in other_fields]
-        new_factor_cols = Vector[eltype(col)[] for col in factor_cols]
-        new_other_cols = Vector[Vector{eltype(col)}[] for col in other_cols]
-        factoridx = Dict()
-        for i in 1:datalen
-            factor = Any[col[begin+i-1] for col in factor_cols]
-            others = Any[col[begin+i-1] for col in other_cols]
-            if haskey(factoridx, factor)
-                idx = factoridx[factor]
-                for (col, x) in zip(new_other_cols, others)
-                    push!(col[idx], x)
-                end
+function _get_source(data, transforms, source_cache)
+    return get!(source_cache, (data, transforms)) do 
+        if isempty(transforms)
+            if Bokeh.ismodelinstance(data, Bokeh.DataSource)
+                return data
+            elseif Bokeh.ismodelinstance(data)
+                error("expecting data to be a DataSource, got a $(Bokeh.modeltype(data).name)")
             else
-                idx = length(factoridx) + 1
-                factoridx[factor] = idx
-                for (col, x) in zip(new_factor_cols, factor)
-                    push!(col, x)
-                end
-                for (col, x) in zip(new_other_cols, others)
-                    push!(col, [x])
-                end
+                return Bokeh.ColumnDataSource(; data)
+            end
+        else
+            source0 = _get_source(data, transforms[1:end-1], source_cache)
+            @assert Bokeh.ismodelinstance(source0)
+            Bokeh.ismodelinstance(source0, Bokeh.ColumnDataSource) || error("can only apply data transforms to ColumnDataSource, got a $(Bokeh.modeltype(source0).name)")
+            data0 = DataFrame(source0.data)
+            data = transforms[end](data0)
+            if data === data0
+                # in-place
+                source0.data = data
+                return source0
+            else
+                return Bokeh.ColumnDataSource(; data)
             end
         end
-        new_data = Dict{String,Any}()
-        for (k, col) in zip(factor_fields, new_factor_cols)
-            new_data[k] = col
-        end
-        for (k, col) in zip(other_fields, new_other_cols)
-            new_data[k] = col
-        end
-        # done
-        new_source = Bokeh.ColumnDataSource(data=new_data)
-        return (multiglyph, new_source, mappings)
-    else
-        error("cannot automatically promote $(glyph.name) to $(glyph.multiglyph) with a $(Bokeh.modeltype(source).name) data source")
     end
 end
+
+function linesby(cols; kw...)
+    cols = cols isa AbstractString ? String[cols] : collect(String, cols)
+    tr = let cols = cols
+        df -> combine(groupby(df, cols), [c => (c in cols ? (x -> [first(x)]) : (x -> [x])) => c for c in names(df)])
+    end
+    return plot(tr, Bokeh.MultiLine; kw...)
+end
+export linesby
+
+function histby(xcol, ncol; kw...)
+    xcol = convert(String, xcol)
+    ncol = convert(String, ncol)
+    tr = let xcol = xcol, ncol = ncol
+        datat() do df
+            return combine(groupby(df, xcol), [xcol => (x->[first(x)]) => xcol, nrow => ncol])
+        end
+    end
+    return tr * glyph(Bokeh.VBar; kw...) * mapping(xcol, ncol)
+end
+export histby
+
+const MAPPING_ALIASES = Dict(
+    :x => [:xs, :right],
+    :y => [:ys, :top],
+)
 
 function draw!(plot::Bokeh.ModelInstance, layers::AnyLayers; theme::Theme=Theme(), legend_location="right")
     Bokeh.ismodelinstance(plot, Bokeh.Plot) || error("expecting a Plot")
@@ -328,44 +354,39 @@ function draw!(plot::Bokeh.ModelInstance, layers::AnyLayers; theme::Theme=Theme(
     for layer in eachlayer(layers)
         # get the data source
         data = layer.data
-        if data === nothing
-            error("no data")
-        elseif Bokeh.ismodelinstance(data)
-            if Bokeh.ismodelinstance(data, Bokeh.DataSource)
-                source = data
-            else
-                error("expecting a DataSource instance")
-            end
-        else
-            source = get!(source_cache, data) do
-                return Bokeh.ColumnDataSource(; data)
-            end
-        end
+        transforms = layer.transforms
+        data === nothing && error("no data")
+        source = _get_source(data, transforms, source_cache)
         # get the glyph
         glyph = layer.glyph
         glyph === nothing && error("no glyph")
-        # get the declared mappings
-        orig_mappings = Dict(k => Mapping(k, v; source, theme) for (k, v) in layer.mappings)
-        # convert Line glyph to MultiLine if required
-        if glyph == Bokeh.Line
-            glyph, source, orig_mappings = _glyph_to_multiglyph(Bokeh.Line, Bokeh.MultiLine, source, orig_mappings)
-        end
-        # get the mappings actually used
-        mappings = empty(orig_mappings)
-        for (k, v) in orig_mappings
+        # find the properties to actually use, i.e. those which are valid for the glyph
+        # and resolving aliases
+        kw = Dict{Symbol,Any}()
+        for (k, v) in layer.properties
             if k in (:color, :alpha) || haskey(glyph.propdescs, k)
-                mappings[k] = v
-            elseif k == :x && !haskey(orig_mappings, :xs) && haskey(glyph.propdescs, :xs)
-                mappings[:xs] = v
-            elseif k == :y && !haskey(orig_mappings, :ys) && haskey(glyph.propdescs, :ys)
-                mappings[:ys] = v
+                kw[k] = v
+            elseif haskey(MAPPING_ALIASES, k)
+                for k2 in MAPPING_ALIASES[k]
+                    if haskey(glyph.propdescs, k2)
+                        if !haskey(layer.properties, k2)
+                            kw[k2] = v
+                        end
+                        break
+                    end
+                end
             end
         end
-        # collect all glyph properties and render the glyph
-        kw = collect(layer.properties)
-        for (k, v) in mappings
-            push!(kw, Pair{Symbol,Any}(k, v.literal))
+        # process properties which are mappings
+        mappings = Dict{Symbol,Mapping}()
+        for (k, v) in collect(kw)
+            if is_mapping(v)
+                m = Mapping(k, v; source, theme)
+                mappings[k] = m
+                kw[k] = m.literal
+            end
         end
+        # render the glyph
         renderer = Bokeh.plot!(plot, glyph; source, kw...)
         # set the axis labels
         for (k, v) in mappings
@@ -388,8 +409,8 @@ function draw!(plot::Bokeh.ModelInstance, layers::AnyLayers; theme::Theme=Theme(
         for (k, v) in mappings
             if v.datatype == "factor" && v.mappingtype in ("color", "marker")
                 title = something(v.label, v.field, string(k))
-                legend = get!(legend_cache, title) do
-                    return Bokeh.plot!(plot, Bokeh.Legend; title, location=legend_location, orientation=(legend_location in ("above", "below") ? "horizontal" : "vertical"))
+                legend = get!(legend_cache, v.field) do
+                    return Bokeh.plot!(plot, Bokeh.Legend; title, location=theme.legend_location, orientation=(theme.legend_location in ("above", "below") ? "horizontal" : "vertical"))
                 end
                 if !any(item.label==v.literal && item.renderers==[renderer] for item in legend.items)
                     if isempty(legend.items)
@@ -406,11 +427,20 @@ function draw!(plot::Bokeh.ModelInstance, layers::AnyLayers; theme::Theme=Theme(
     return plot
 end
 
-function Bokeh.figure(layer::AnyLayers; theme=NamedTuple(), legend_location="right", kw...)
-    fig = Bokeh.figure(; kw...)
+function draw(layer::AnyLayers; theme=NamedTuple(), figure=NamedTuple())
     theme = theme isa Theme ? theme : Theme(; theme...)
-    draw!(fig, layer; theme, legend_location)
-    return fig
+    figure = Bokeh.ismodelinstance(figure) ? figure : Bokeh.figure(; merge(theme.figure_opts, figure)...)
+    draw!(figure, layer; theme)
+    return figure
+end
+function draw(; kw...)
+    return layer -> draw(layer; kw...)
+end
+
+function Base.display(d::Bokeh.BokehDisplay, layer::AnyLayers)
+    theme = get(Bokeh.setting(:theme).attrs, :Algebrokeh, nothing)
+    theme = theme === nothing ? Theme() : Theme(; theme...)
+    return display(d, draw(layer; theme))
 end
 
 end # module
