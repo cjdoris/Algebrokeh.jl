@@ -17,30 +17,26 @@ Base.@kwdef struct Layer
 end
 
 function plot(args...; kw...)
-    data = nothing
-    glyphs = Bokeh.ModelType[]
-    transforms = []
-    properties = Dict{Symbol,Any}(kw)
+    layers = Layers([Layer()])
     for arg in args
         if Tables.istable(arg) || Bokeh.ismodelinstance(arg, Bokeh.DataSource)
-            if data === nothing
-                data = arg
-            else
-                error("cannot specify multiple data sources")
-            end
+            layers *= Layer(; data=arg)
         elseif isa(arg, Bokeh.ModelType) && Bokeh.issubmodeltype(arg, Bokeh.Glyph)
-            push!(glyphs, arg)
+            layers *= Layer(; glyph=arg)
         elseif isa(arg, Function)
-            push!(transforms, arg)
+            layers *= Layer(; transforms=[arg])
+        elseif isa(arg, AnyLayers)
+            layers *= arg
+        elseif isa(arg, AbstractVector)
+            layers *= Layers(Layer[layer for x in arg for layer in eachlayer(plot(x))])
         else
             error("unexpected argument of type $(typeof(arg))")
         end
     end
-    ans = Layers([Layer(; data, transforms, properties)])
-    if !isempty(glyphs)
-        ans *= Layers([Layer(; glyph) for glyph in glyphs])
+    if !isempty(kw)
+        layers *= Layer(; properties=kw)
     end
-    return ans
+    return layers
 end
 
 function Base.:(*)(x::Layer, y::Layer)
@@ -60,6 +56,8 @@ end
 
 Base.convert(::Type{Layers}, x::Layers) = x
 Base.convert(::Type{Layers}, x::Layer) = Layers(Layer[x])
+
+Base.promote_rule(::Type{Layer}, ::Type{Layers}) = Layers
 
 eachlayer(x::Layer) = [x]
 eachlayer(x::Layers) = x.layers
@@ -166,11 +164,16 @@ function is_mapping(x)
     end
 end
 
+function mapfield(x::AbstractString)
+    x = convert(String, x)
+    startswith(x, '@') || error("mapping field should start with '@', got $(repr(x))")
+    return x[2:end]
+end
+
 function mapping!(m::Mapping, x)
     @nospecialize
     if x isa AbstractString
-        startswith(x, '@') || error("mapping field should start with '@'")
-        m.field = String(x)[2:end]
+        m.field = mapfield(x)
         return
     elseif x isa Bokeh.Value || x isa Bokeh.Field || x isa Bokeh.Expr
         m.literal = x
@@ -341,6 +344,29 @@ function histby(xcol, ncol; kw...)
     return tr * glyph(Bokeh.VBar; kw...) * mapping(xcol, ncol)
 end
 export histby
+
+function plotvbar(args...; x, y, dodge=nothing, kw...)
+    dodge === nothing && return plot(args..., Bokeh.VBar; x, y, kw...)
+    xcol = mapfield(x)
+    ycol = mapfield(y)
+    dodgecol = mapfield(dodge)
+    width = get(kw, :width, nothing)
+    newxcol = string(gensym("dodge#$xcol#$dodgecol"))
+    function tr(df)
+        # TODO: the list of factors should be defined somewhere extrinsic - maybe use DataFrames metadata?
+        facidxs = Dict(x=>i for (i, x) in enumerate(sort(unique(df[!, dodgecol]))))
+        nfacs = length(facidxs)
+        if nfacs > 0
+            w = something(width, 1/nfacs)
+            df[!, newxcol] = [(a, (facidxs[x] - (nfacs + 1) / 2) * w) for (a, x) in zip(df[!, xcol], df[!, dodgecol])]
+        else
+            df[!, newxcol] = []
+        end
+        return df
+    end
+    return plot(args..., Bokeh.VBar, tr; x="@$newxcol", y, kw...)
+end
+export plotvbar
 
 const MAPPING_ALIASES = Dict(
     :x => [:xs, :right],

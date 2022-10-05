@@ -22,7 +22,7 @@ plot(d, Scatter, x="@time", y="@value", color="@name")
 # A more complex example which uses several different glyphs: `Scatter`, `Text` and
 # `MultiLine`. The `Line` glyph does not allow `color` to be a mapping, so the `linesby()`
 # function reshapes the data into the format expected by `MultiLine`.
-plot(d, x="@time", y="@value", color="@name", text="@name") * (plot(Scatter) + plot(Bokeh.Text) + linesby("name"))
+plot(d, [Scatter, Bokeh.Text, linesby("name")], x="@time", y="@value", color="@name", text="@name")
 ```
 
 ![Example plot](https://raw.githubusercontent.com/cjdoris/Algebrokeh.jl/main/example.png)
