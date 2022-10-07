@@ -20,7 +20,7 @@ data = Bokeh.Data.penguins()
 # (such as "bill_length_mm") is used as the label. You can specify a label in the plot with
 # `x="@bill_length_mm"=>"Bill Length (mm)"`.
 using DataFrames
-data = DataFrame(Bokeh.Data.penguins())
+data = DataFrame(data)
 colmetadata!(data, :species, "label", "Species"; style=:note)
 colmetadata!(data, :island, "label", "Island"; style=:note)
 colmetadata!(data, :bill_length_mm, "label", "Bill Length (mm)"; style=:note)
