@@ -6,23 +6,26 @@ to [Bokeh.jl](https://github.com/cjdoris/Bokeh.jl).
 ## Example
 
 ```julia
-using Revise, DataFrames, Random, Bokeh, Algebrokeh
+using Bokeh, Algebrokeh
 
-# (optional) displays the plot in the browser - omit if you are in a notebook
+# (optional) Display the plot in the browser. Omit if you are in a notebook.
 Bokeh.settings!(display=:browser)
 
-# generate some example data
-Random.seed!(1234)
-d = DataFrame(name = repeat(["A","B","C","D","E","F"], inner=4), time=repeat([0,1,3,6], outer=6), value = rand(24))
+# The table of data to plot from.
+data = Bokeh.Data.penguins()
 
-# Create a simple scatter plot. It is automatically displayed at the REPL or in a notebook.
-# From a function, call `display` on the result to show it.
-plot(d, Scatter, x="@time", y="@value", color="@name")
+# (optional) Convert the data table to a DataFrame and add labels to some of its columns.
+# This will result in nicer axis labels automatically. If you don't do this, the field name
+# (such as "bill_length_mm") is used as the label. You can specify a label in the plot with
+# `x="@bill_length_mm"=>"Bill Length (mm)"`.
+using DataFrames
+data = DataFrame(Bokeh.Data.penguins())
+colmetadata!(data, :bill_length_mm, "label", "Bill Length (mm)"; style=:note)
+colmetadata!(data, :bill_depth_mm, "label", "Bill Depth (mm)"; style=:note)
 
-# A more complex example which uses several different glyphs: `Scatter`, `Text` and
-# `MultiLine`. The `Line` glyph does not allow `color` to be a mapping, so the `linesby()`
-# function reshapes the data into the format expected by `MultiLine`.
-plot(d, [Scatter, Bokeh.Text, linesby("name")], x="@time", y="@value", color="@name", text="@name")
+# Create a scatter plot. You can use any Bokeh glyph instead of `Scatter`. Named arguments
+# whose value start with "@" map columns from the data to visual properties on the glyph.
+plot(data, Scatter, x="@bill_length_mm", y="@bill_depth_mm", color="@species", marker="@island", size=10, fill_alpha=0.5)
 ```
 
 ![Example plot](https://raw.githubusercontent.com/cjdoris/Algebrokeh.jl/main/example.png)
