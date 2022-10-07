@@ -10,7 +10,7 @@ using Bokeh, Algebrokeh
 
 # (optional) Display the plot in the browser. Omit if you are in a notebook.
 # (optional) Use the Algebrokeh default theme.
-Bokeh.settings!(display=:browser, theme="algebrokeh")
+Bokeh.settings!(display="browser", theme="algebrokeh")
 
 # The table of data to plot from.
 data = Bokeh.Data.penguins()
