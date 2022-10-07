@@ -3,7 +3,8 @@ module Algebrokeh
 using Base: @kwdef
 using Bokeh: Bokeh
 using DataFrames: DataFrame, groupby, combine, nrow
-using Tables: istable
+using Tables: Tables
+using DataAPI: DataAPI
 
 export plot
 
@@ -18,15 +19,17 @@ export plot
 Holds information about a collection of data, such as a column in a DataSource.
 """
 @kwdef struct DataInfo
-    datatype::Union{Nothing,DataType} = nothing
-    factors::Union{Nothing,Vector} = nothing
+    datatype::DataType = NUMBER_DATA
+    factors::Vector = []
+    label::Any = nothing
 end
 
 """
 A DataSource, plus information about the data in its columns.
 """
-struct Data
+@kwdef struct Data
     source::Union{Bokeh.ModelInstance}
+    table::Any
     columns::Dict{String,DataInfo}
 end
 
@@ -35,7 +38,7 @@ A specifier for a field. Can also be a collection of 2 or 3 fields, to treat the
 hierarchical factor.
 """
 struct Field
-    name::Union{String,Tuple{String,String},Tuple{String,String,String}}
+    names::Union{String,Tuple{String,String},Tuple{String,String,String}}
 end
 
 """
@@ -43,12 +46,12 @@ A mapping value, which defines some connection between a field of data and a vis
 property, such as color, marker or location.
 """
 @kwdef struct Mapping
-    name::Union{Nothing,String}
-    type::Union{Nothing,MappingType}
+    name::String
+    type::MappingType
     field::Field
     label::Any = nothing
     transforms::Vector{Bokeh.ModelInstance} = Bokeh.ModelInstance[]
-    datainfo::DataInfo = DataInfo()
+    datainfo::Union{DataInfo,Nothing} = nothing
 end
 
 """
@@ -97,18 +100,23 @@ Base.:(+)(xs::Layers, ys::Layers) = Layers(vcat(xs.layers, ys.layers))
 Base.:(*)(xs::Layers, y::Layer) = Layers([x*y for x in xs.layers])
 Base.:(*)(xs::Layers, ys::Layers) = Layers([x*y for x in xs.layers for y in ys.layers])
 
+"""
+    plot(args...; kw...)
+
+Create an Algebrokeh plot.
+"""
 function plot(args...; kw...)
     layers = one(Layers)
     for arg in args
         if arg isa Layer || arg isa Layers
             layers *= arg
         elseif arg isa AbstractVector
-            layers *= Layers([plot(x) for x in arg])
+            layers *= Layers([layer for x in arg for layer in plot(x).layers])
         elseif arg isa Function
             layers *= Layer(; transforms=[arg])
         elseif arg isa Bokeh.ModelType && Bokeh.issubmodeltype(arg, Bokeh.Glyph)
             layers *= Layer(; glyph=arg)
-        elseif arg isa Data || Bokeh.ismodelinstance(arg, Bokeh.DataSource) || istable(arg)
+        elseif arg isa Data || Bokeh.ismodelinstance(arg, Bokeh.DataSource) || Tables.istable(arg)
             layers *= plotdata(arg)
         else
             throw(ArgumentError("invalid argument of type $(typeof(arg))"))
@@ -123,32 +131,45 @@ end
 
 ### DATA
 
-function plotdata(data::Data)
-    return Layers([Layer(; data)])
-end
-
-function plotdata(data::Bokeh.ModelInstance)
-    if Bokeh.ismodelinstance(data, Bokeh.DataSource)
-        columns = Dict{String,DataInfo}()
+function plotdata(data)
+    if !isa(data, Data)
         if Bokeh.ismodelinstance(data, Bokeh.ColumnDataSource)
-            for (name, col) in data.data
-                if !isempty(col) && all(x->isa(x,Factor), col)
-                    columns[name] = DataInfo(datatype=FACTOR_DATA, factors=sort(unique(col)))
+            table = DataFrame(data.data)
+            source = data
+        elseif Bokeh.ismodelinstance(data, Bokeh.DataSource)
+            table = nothing
+            source = data
+        elseif Bokeh.ismodelinstance(data)
+            throw(ArgumentError("expecting a DataSource, got a $(Bokeh.modeltype(data).name)"))
+        elseif Tables.istable(data)
+            table = data
+            source = Bokeh.ColumnDataSource(; data)
+        else
+            throw(ArgumentError("expecting a table, got a $(typeof(data))"))
+        end
+        columns = Dict{String,DataInfo}()
+        if table !== nothing
+            tablecols = Tables.columns(table)
+            for name in Tables.columnnames(tablecols)
+                col = Tables.getcolumn(tablecols, name)
+                if DataAPI.colmetadatasupport(typeof(table)).read
+                    label = DataAPI.colmetadata(table, name, "label", nothing)
+                else
+                    label = nothing
                 end
+                if !isempty(col) && all(x->isa(x, Factor), col)
+                    datatype = FACTOR_DATA
+                    factors = sort(unique(col))
+                else
+                    datatype = NUMBER_DATA
+                    factors = []
+                end
+                columns[String(name)] = DataInfo(; datatype, factors, label)
             end
         end
-        return plotdata(Data(data, columns))
-    else
-        throw(ArgumentError("expecting a DataSource, got a $(Bokeh.modeltype(data).name)"))
+        data = Data(; source, table, columns)
     end
-end
-
-function plotdata(data)
-    if istable(data)
-        return plotdata(Bokeh.ColumnDataSource(; data))
-    else
-        throw(ArgumentError("expecting a table, got a $(typeof(data))"))
-    end
+    return Layer(; data)
 end
 
 
@@ -195,7 +216,7 @@ function parse_mapping(k, v)
     end
     # remaining entries define optional info
     transforms = Bokeh.ModelInstance[]
-    datainfo = DataInfo()
+    datainfo = nothing
     label = nothing
     for x in vs[2:end]
         if Bokeh.ismodelinstance(x, Bokeh.Transform)
@@ -214,6 +235,66 @@ end
 
 ### DRAW
 
+function _get_palette(p, n=nothing)
+    if p isa AbstractString
+        # get a named palette
+        pname = p
+        p = get(Bokeh.PALETTES, pname, nothing)
+        if p === nothing
+            # get a named palette group
+            pg = get(Bokeh.PALETTE_GROUPS, pname, nothing)
+            pg === nothing && error("no such palette: $(pname)")
+            isempty(pg) && error("empty palette group: $(pname)")
+            p = _get_palette(pg, n)
+        end
+    elseif p isa AbstractDict
+        # palette group (length -> palette)
+        pg = p
+        isempty(pg) && error("empty palette group")
+        pbest = nothing
+        nbest = nothing
+        for (ncur, pcur) in pg
+            if nbest === nothing || ((n === nothing || nbest < n) ? (ncur > nbest) : (n ≤ ncur < nbest))
+                nbest = ncur
+                pbest = pcur
+            end
+        end
+        @assert nbest !== nothing
+        @assert pbest !== nothing
+        p = _get_palette(pbest, n)
+    else
+        p = collect(String, p)
+    end
+    if n !== nothing
+        if length(p) < n
+            p = repeat(p, cld(n, length(p)))
+        end
+        if length(p) > n
+            p = p[1:n]
+        end
+        @assert length(p) == n
+    end
+    return p
+end
+
+function _get_markers(m, n=nothing)
+    m = collect(String, m)
+    if n !== nothing
+        if length(m) < n
+            m = repeat(m, cld(n, length(m)))
+        end
+        if length(m) > n
+            m = m[1:n]
+        end
+        @assert length(m) == n
+    end
+    return m
+end
+
+function _get_hatch_patterns(p, n=nothing)
+    return _get_markers(p, n)
+end
+
 function _get_data(data, transforms, source_cache)
     if isempty(transforms)
         return data
@@ -222,18 +303,94 @@ function _get_data(data, transforms, source_cache)
     end
 end
 
-function _get_property(v; data)
+function _get_property(v; data::Data)
     if v isa Mapping
-        # TODO
-        return v.field.name
+        # field
+        fields = v.field.names
+        if fields isa String
+            field = fields
+        else
+            # TODO: add a new combined column
+            error("not implemented: hierarchical fields")
+        end
+        # datainfo
+        datainfo = v.datainfo
+        if datainfo === nothing
+            datainfo = get(data.columns, field, nothing)
+            if datainfo === nothing
+                error("no DataInfo for column $(repr(field))")
+            end
+        end
+        datatype = datainfo.datatype
+        factors = datainfo.factors
+        nfactors = length(factors)
+        label = datainfo.label
+        # transforms
+        transforms = copy(v.transforms)
+        if v.type == DATA_MAP
+            # no extra transforms
+        elseif v.type == COLOR_MAP
+            if datatype == NUMBER_DATA
+                palette = _get_palette("Viridis256")
+                push!(transforms, Bokeh.LinearColorMapper(; palette))
+            else @assert datatype == FACTOR_DATA
+                palette = _get_palette("Dark2", nfactors)
+                push!(transforms, Bokeh.CategoricalColorMapper(; palette, factors))
+            end
+        elseif v.type == MARKER_MAP
+            if datatype == FACTOR_DATA
+                markers = _get_markers(["circle", "square", "triangle"], nfactors)
+                push!(transforms, Bokeh.CategoricalMarkerMapper(; markers, factors))
+            else
+                error("$(v.name) is a marker mapping but $fields is not categorical")
+            end
+        else @assert v.type == HATCH_PATTERN_MAP
+            if datatype == FACTOR_DATA
+                patterns = _get_hatch_patterns(["/", "\\", "+", ".", "o"], nfactors)
+                push!(transforms, Bokeh.CategoricalPatternMapper(; patterns, factors))
+            else
+                error("$(v.name) is a hatch-pattern mapping but $fields is not categorical")
+            end
+        end
+        # done
+        if length(transforms) == 0
+            literal = Bokeh.Field(field)
+        elseif length(transforms) == 1
+            literal = Bokeh.transform(field, transforms[1])
+        else
+            # TODO: https://stackoverflow.com/questions/48772907/layering-or-nesting-multiple-bokeh-transforms
+            error("not implemented: multiple transforms (on mapping $(v.name))")
+        end
     else
-        return v
+        label = nothing
+        fields = nothing
+        literal = v
     end
+    return (; literal, label, fields)
+end
+
+const PROPERTY_ALIASES = Dict(
+    :x => [:xs, :right],
+    :y => [:ys, :top],
+)
+
+function _get_label(labels, fieldnames, keys)
+    list = Any[label for key in keys for label in get(labels, key, [])]
+    if !isempty(list)
+        return first(list)
+    end
+    list = Any[label for key in keys for label in get(fieldnames, key, [])]
+    if !isempty(list)
+        return string(first(list))
+    end
+    return nothing
 end
 
 function draw(layers::Layers)
     fig = Bokeh.figure()
     source_cache = Dict{Any,Bokeh.ModelInstance}()
+    labels = Dict{Symbol,Vector{Any}}()
+    fieldnames = Dict{Symbol,Vector{Any}}()
     for layer in layers.layers
         # get the data
         orig_data = layer.data
@@ -244,11 +401,36 @@ function draw(layers::Layers)
         # get the glyph
         glyph = layer.glyph
         glyph === nothing && error("no glyph")
-        # get the properties
-        kw = Dict{Symbol,Any}(k => _get_property(v; data) for (k, v) in layer.properties)
+        # get the properties actually applicable to this type, resolving aliases too
+        props = Dict{Symbol,Any}()
+        for (k, v) in layer.properties
+            if k in (:color, :alpha) || haskey(glyph.propdescs, k)
+                props[k] = v
+            elseif haskey(PROPERTY_ALIASES, k)
+                for k2 in PROPERTY_ALIASES[k]
+                    if haskey(glyph.propdescs, k2)
+                        if !haskey(layer.properties, k2)
+                            props[k2] = v
+                        end
+                        break
+                    end
+                end
+            end
+        end
+        # resolve the properties
+        kw = Dict{Symbol,Any}()
+        for (k, v) in props
+            x = _get_property(v; data)
+            kw[k] = x.literal
+            x.label !== nothing && push!(get!(Vector{Any}, labels, k), x.label)
+            x.fields !== nothing && push!(get!(Vector{Any}, fieldnames, k), x.fields)
+        end
         # plot the glyph
         Bokeh.plot!(fig, glyph; source, kw...)
     end
+    # axis labels
+    fig.x_axis.axis_label = _get_label(labels, fieldnames, [:x, :xs, :right, :left])
+    fig.y_axis.axis_label = _get_label(labels, fieldnames, [:y, :ys, :top, :bottom])
     return fig
 end
 
@@ -264,72 +446,6 @@ end
 
 
 
-# ### LAYER
-
-# Base.@kwdef struct Layer
-#     data::Any=nothing
-#     transforms::Vector{Any}=[]
-#     glyph::Union{Bokeh.ModelType,Nothing}=nothing
-#     properties::Dict{Symbol,Any} = Dict{Symbol,Any}()
-# end
-
-# function plot(args...; kw...)
-#     layers = Layers([Layer()])
-#     for arg in args
-#         if istable(arg) || Bokeh.ismodelinstance(arg, Bokeh.DataSource)
-#             layers *= Layer(; data=arg)
-#         elseif isa(arg, Bokeh.ModelType) && Bokeh.issubmodeltype(arg, Bokeh.Glyph)
-#             layers *= Layer(; glyph=arg)
-#         elseif isa(arg, Function)
-#             layers *= Layer(; transforms=[arg])
-#         elseif isa(arg, AnyLayers)
-#             layers *= arg
-#         elseif isa(arg, AbstractVector)
-#             layers *= Layers(Layer[layer for x in arg for layer in eachlayer(plot(x))])
-#         else
-#             error("unexpected argument of type $(typeof(arg))")
-#         end
-#     end
-#     if !isempty(kw)
-#         layers *= Layer(; properties=kw)
-#     end
-#     return layers
-# end
-
-# function Base.:(*)(x::Layer, y::Layer)
-#     data = y.data !== nothing ? y.data : x.data
-#     glyph = y.glyph !== nothing ? y.glyph : x.glyph
-#     properties = merge(x.properties, y.properties)
-#     transforms = vcat(x.transforms, y.transforms)
-#     return Layer(; data, glyph, properties, transforms)
-# end
-
-
-# ### LAYERS
-
-# struct Layers
-#     layers::Vector{Layer}
-# end
-
-# Base.convert(::Type{Layers}, x::Layers) = x
-# Base.convert(::Type{Layers}, x::Layer) = Layers(Layer[x])
-
-# Base.promote_rule(::Type{Layer}, ::Type{Layers}) = Layers
-
-# eachlayer(x::Layer) = [x]
-# eachlayer(x::Layers) = x.layers
-
-# const AnyLayers = Union{Layer,Layers}
-
-# function Base.:(*)(x::AnyLayers, y::AnyLayers)
-#     return Layers(Layer[x*y for x in eachlayer(x) for y in eachlayer(y)])
-# end
-
-# function Base.:(+)(x::AnyLayers, y::AnyLayers)
-#     return Layers(vcat(eachlayer(x), eachlayer(y)))
-# end
-
-
 # ### THEME
 
 # Base.@kwdef mutable struct Theme
@@ -340,181 +456,7 @@ end
 #     figure_opts::NamedTuple = NamedTuple()
 # end
 
-# function get_palette(p, n=nothing)
-#     if p isa AbstractString
-#         # get a named palette
-#         pname = p
-#         p = get(Bokeh.PALETTES, pname, nothing)
-#         if p === nothing
-#             # get a named palette group
-#             pg = get(Bokeh.PALETTE_GROUPS, pname, nothing)
-#             pg === nothing && error("no such palette: $(pname)")
-#             isempty(pg) && error("empty palette group: $(pname)")
-#             p = get_palette(pg, n)
-#         end
-#     elseif p isa AbstractDict
-#         # palette group (length -> palette)
-#         pg = p
-#         isempty(pg) && error("empty palette group")
-#         pbest = nothing
-#         nbest = nothing
-#         for (ncur, pcur) in pg
-#             if nbest === nothing || ((n === nothing || nbest < n) ? (ncur > nbest) : (n ≤ ncur < nbest))
-#                 nbest = ncur
-#                 pbest = pcur
-#             end
-#         end
-#         @assert nbest !== nothing
-#         @assert pbest !== nothing
-#         p = get_palette(pbest, n)
-#     else
-#         p = collect(String, p)
-#     end
-#     if n !== nothing
-#         if length(p) < n
-#             p = repeat(p, cld(n, length(p)))
-#         end
-#         if length(p) > n
-#             p = p[1:n]
-#         end
-#         @assert length(p) == n
-#     end
-#     return p
-# end
-
-# function get_markers(m, n=nothing)
-#     m = collect(String, m)
-#     if n !== nothing
-#         if length(m) < n
-#             m = repeat(m, cld(n, length(m)))
-#         end
-#         if length(m) > n
-#             m = m[1:n]
-#         end
-#         @assert length(m) == n
-#     end
-#     return m
-# end
-
-
 # ### MAPPING
-
-# Base.@kwdef mutable struct Mapping
-#     literal::Any = nothing
-#     field::Union{String,Nothing} = nothing
-#     transforms::Vector{Bokeh.ModelInstance} = Bokeh.ModelInstance[]
-#     label::Any = nothing
-#     datatype::Union{String,Nothing} = nothing  # number or factor
-#     factors::Union{Vector{Any},Nothing} = nothing
-#     mappingname::Union{String,Nothing} = nothing
-#     mappingtype::Union{String,Nothing} = nothing
-# end
-
-# function is_mapping(x)
-#     @nospecialize
-#     if x isa AbstractString
-#         return startswith(x, '@')
-#     elseif x isa Pair
-#         return is_mapping(x.first)
-#     else
-#         return x isa Bokeh.Value || x isa Bokeh.Field || x isa Bokeh.Expr
-#     end
-# end
-
-# function mapfield(x::AbstractString)
-#     x = convert(String, x)
-#     startswith(x, '@') || error("mapping field should start with '@', got $(repr(x))")
-#     return x[2:end]
-# end
-
-# function mapping!(m::Mapping, x)
-#     @nospecialize
-#     if x isa AbstractString
-#         m.field = mapfield(x)
-#         return
-#     elseif x isa Bokeh.Value || x isa Bokeh.Field || x isa Bokeh.Expr
-#         m.literal = x
-#         return
-#     elseif x isa Pair
-#         if x.second isa Pair
-#             mapping!(m, (x.first => x.second.first) => x.second.second)
-#             return
-#         elseif x.second isa AbstractString || Bokeh.ismodelinstance(x.second, Bokeh.BaseText)
-#             mapping!(m, x.first)
-#             m.label = x.second
-#             return
-#         elseif Bokeh.ismodelinstance(x.second, Bokeh.Transform)
-#             mapping!(m, x.first)
-#             push!(m.transforms, x.second)
-#             return
-#         end
-#     end
-#     error("invalid mapping: $(repr(x))")
-# end
-
-# function Mapping(k::Symbol, v::Any; source, theme)
-#     @nospecialize
-#     # get mapping type
-#     mappingname = String(k)
-#     if occursin("color", mappingname)
-#         mappingtype = "color"
-#     elseif occursin("marker", mappingname)
-#         mappingtype = "marker"
-#     else
-#         mappingtype = "data"
-#     end
-#     m = Mapping(; mappingname, mappingtype)
-#     # populate from the value
-#     mapping!(m, v)
-#     # fill in any blanks
-#     if m.literal === nothing
-#         m.field === nothing && error("mapping field not specified")
-#         if m.datatype === nothing
-#             source === nothing && error("source not specified")
-#             column = source.data[m.field]
-#             if all(x === missing || x isa AbstractString || x isa Tuple for x in column)
-#                 m.datatype = "factor"
-#             else
-#                 m.datatype = "number"
-#             end
-#         end
-#         if m.datatype == "factor" && m.factors === nothing
-#             source === nothing && error("source not specified")
-#             column = source.data[m.field]
-#             m.factors = sort(unique(column))
-#         end
-#         transforms = copy(m.transforms)
-#         if m.mappingtype == "data"
-#             # nothing to do
-#         elseif m.mappingtype == "color"
-#             if m.datatype == "number"
-#                 push!(transforms, Bokeh.LinearColorMapper(; palette=get_palette(theme.continuous_palette)))
-#             elseif m.datatype == "factor"
-#                 push!(transforms, Bokeh.CategoricalColorMapper(; palette=get_palette(theme.categorical_palette, length(m.factors)), factors=m.factors))
-#             else
-#                 error("unknown datatype: $(m.datatype)")
-#             end
-#         elseif m.mappingtype == "marker"
-#             if m.datatype == "factor"
-#                 push!(transforms, Bokeh.CategoricalMarkerMapper(; markers=get_markers(theme.markers, length(m.factors)), factors=m.factors))
-#             else
-#                 error("marker mapping must be categorical")
-#             end
-#         else
-#             error("unknown mappingtype: $(m.datatype)")
-#         end
-#         if isempty(transforms)
-#             m.literal = Bokeh.Field(m.field)
-#         elseif length(transforms) == 1
-#             m.literal = Bokeh.transform(m.field, transforms[1])
-#         else
-#             # TODO: https://stackoverflow.com/questions/48772907/layering-or-nesting-multiple-bokeh-transforms
-#             error("not implemented: multiple transforms (on mapping $mappingname)")
-#         end
-#     end
-#     return m
-# end
-
 
 # # ### VSTACK
 
@@ -550,7 +492,6 @@ end
 # function hstack(fields; kw...)
 #     return stack(:left, :right, fields; kw...)
 # end
-
 
 # ### DRAW
 
