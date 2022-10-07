@@ -340,29 +340,62 @@ function _get_property(v; data::Data)
         end
         # transforms
         transforms = copy(v.transforms)
+        # mapper
+        mapper = isempty(transforms) || !Bokeh.ismodelinstance(last(transforms), Bokeh.Mapper) ? nothing : last(transforms)
         if v.type == DATA_MAP
-            # no extra transforms
+            # data is not mapped
         elseif v.type == COLOR_MAP
             if datatype == NUMBER_DATA
-                palette = _get_palette("Viridis256")
-                push!(transforms, Bokeh.LinearColorMapper(; palette))
+                if mapper === nothing
+                    mapper = Bokeh.LinearColorMapper()
+                    push!(transforms, mapper)
+                end
+                if Bokeh.ismodelinstance(mapper, Bokeh.ContinuousColorMapper)
+                    if mapper.palette === Bokeh.Undefined()
+                        mapper.palette = _get_palette("Viridis256")
+                    end
+                end
             else @assert datatype == FACTOR_DATA
-                palette = _get_palette("Dark2", nfactors)
-                push!(transforms, Bokeh.CategoricalColorMapper(; palette, factors))
+                if mapper === nothing
+                    mapper = Bokeh.CategoricalColorMapper()
+                    push!(transforms, mapper)
+                end
+                if Bokeh.ismodelinstance(mapper, Bokeh.CategoricalColorMapper)
+                    if mapper.palette === Bokeh.Undefined()
+                        mapper.palette = _get_palette("Dark2", nfactors)
+                    end
+                end
             end
         elseif v.type == MARKER_MAP
             if datatype == FACTOR_DATA
-                markers = _get_markers(["circle", "square", "triangle"], nfactors)
-                push!(transforms, Bokeh.CategoricalMarkerMapper(; markers, factors))
+                if mapper === nothing
+                    mapper = Bokeh.CategoricalMarkerMapper()
+                    push!(transforms, mapper)
+                end
+                if Bokeh.ismodelinstance(mapper, Bokeh.CategoricalMarkerMapper)
+                    if mapper.markers === Bokeh.Undefined()
+                        mapper.markers = _get_markers(["circle", "square", "triangle"], nfactors)
+                    end
+                end
             else
                 error("$(v.name) is a marker mapping but $fields is not categorical")
             end
         else @assert v.type == HATCH_PATTERN_MAP
             if datatype == FACTOR_DATA
-                patterns = _get_hatch_patterns(["/", "\\", "+", ".", "o"], nfactors)
-                push!(transforms, Bokeh.CategoricalPatternMapper(; patterns, factors))
+                if mapper === nothing
+                    mapper = Bokeh.CategoricalPatternMapper()
+                    push!(transforms, mapper)
+                end
+                if Bokeh.ismodelinstance(mapper, Bokeh.CategoricalPatternMapper)
+                    mapper.patterns = _get_hatch_patterns(["/", "\\", "+", ".", "o"], nfactors)
+                end
             else
                 error("$(v.name) is a hatch-pattern mapping but $fields is not categorical")
+            end
+        end
+        if Bokeh.ismodelinstance(mapper, Bokeh.CategoricalMapper)
+            if mapper.factors === Bokeh.Undefined()
+                mapper.factors = factors
             end
         end
         # done
@@ -385,9 +418,9 @@ const PROPERTY_ALIASES = Dict(
     :y => [:ys, :top],
 )
 
-function _get_label(layers, keys)
-    props = Any[v for layer in layers for (k, v) in layer.props if k in keys]
-    labels = Any[p.label for p in props if p.label !== nothing]
+function _get_axis_label(layers, keys)
+    props = [v for layer in layers for (k, v) in layer.props if k in keys]
+    labels = [p.label for p in props if p.label !== nothing]
     if !isempty(labels)
         return first(labels)
     end
@@ -398,6 +431,29 @@ function _get_label(layers, keys)
     return nothing
 end
 
+function _get_range_scale_axis(layers, keys)
+    props = [v for layer in layers for (k, v) in layer.props if k in keys]
+    is_factor = false
+    factors = []
+    for v in props
+        if v.datainfo.datatype == FACTOR_DATA
+            is_factor = true
+            union!(factors, v.datainfo.factors)
+        end
+    end
+    if is_factor
+        range = Bokeh.FactorRange(; factors)
+        scale = Bokeh.CategoricalScale()
+        axis = Bokeh.CategoricalAxis()
+    else
+        range = Bokeh.DataRange1d()
+        scale = Bokeh.LinearScale()
+        axis = Bokeh.LinearAxis()
+    end
+    axis.axis_label = _get_axis_label(layers, keys)
+    return (range, scale, axis)
+end
+
 @kwdef struct ResolvedLayer
     orig::Layer
     data::Data
@@ -406,7 +462,7 @@ end
 end
 
 function draw(layers::Layers)
-    fig = Bokeh.figure()
+    fig = Bokeh.Figure()
 
     # PLOT/RESOLVE EACH LAYER
     source_cache = Dict{Any,Bokeh.ModelInstance}()
@@ -446,9 +502,14 @@ function draw(layers::Layers)
         push!(resolved, ResolvedLayer(; orig=layer, data, props, renderer))
     end
 
-    # AXIS LABELS
-    fig.x_axis.axis_label = _get_label(resolved, [:x, :xs, :right, :left])
-    fig.y_axis.axis_label = _get_label(resolved, [:y, :ys, :top, :bottom])
+    # RANGES, SCALES and AXES
+    fig.x_range, fig.x_scale, x_axis = _get_range_scale_axis(resolved, [:x, :xs, :right, :left])
+    fig.y_range, fig.y_scale, y_axis = _get_range_scale_axis(resolved, [:y, :ys, :top, :bottom])
+    Bokeh.plot!(fig, x_axis, location="below")
+    Bokeh.plot!(fig, y_axis, location="left")
+
+    # TOOLS
+    fig.toolbar = Bokeh.figure().toolbar
 
     # LEGENDS
     # Find all layers+props for categorical mappings.
