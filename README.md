@@ -9,7 +9,8 @@ to [Bokeh.jl](https://github.com/cjdoris/Bokeh.jl).
 using Bokeh, Algebrokeh
 
 # (optional) Display the plot in the browser. Omit if you are in a notebook.
-Bokeh.settings!(display=:browser)
+# (optional) Use the Algebrokeh default theme.
+Bokeh.settings!(display=:browser, theme="algebrokeh")
 
 # The table of data to plot from.
 data = Bokeh.Data.penguins()
