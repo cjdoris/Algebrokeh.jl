@@ -15,11 +15,13 @@ Bokeh.settings!(display=:browser)
 data = Bokeh.Data.penguins()
 
 # (optional) Convert the data table to a DataFrame and add labels to some of its columns.
-# This will result in nicer axis labels automatically. If you don't do this, the field name
+# This will result in nicer labels automatically. If you don't do this, the field name
 # (such as "bill_length_mm") is used as the label. You can specify a label in the plot with
 # `x="@bill_length_mm"=>"Bill Length (mm)"`.
 using DataFrames
 data = DataFrame(Bokeh.Data.penguins())
+colmetadata!(data, :species, "label", "Species"; style=:note)
+colmetadata!(data, :island, "label", "Island"; style=:note)
 colmetadata!(data, :bill_length_mm, "label", "Bill Length (mm)"; style=:note)
 colmetadata!(data, :bill_depth_mm, "label", "Bill Depth (mm)"; style=:note)
 

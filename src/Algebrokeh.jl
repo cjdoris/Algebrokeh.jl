@@ -303,12 +303,22 @@ function _get_data(data, transforms, source_cache)
     end
 end
 
+@kwdef struct ResolvedProperty
+    orig::Any
+    value::Any
+    label::Any = nothing
+    field::Union{Field,Nothing} = nothing
+    fieldname::Union{String,Nothing} = nothing
+    datainfo::Union{DataInfo,Nothing} = nothing
+end
+
 function _get_property(v; data::Data)
     if v isa Mapping
         # field
-        fields = v.field.names
-        if fields isa String
-            field = fields
+        field = v.field
+        fieldnames = field.names
+        if fieldnames isa String
+            fieldname = fieldnames
         else
             # TODO: add a new combined column
             error("not implemented: hierarchical fields")
@@ -316,7 +326,7 @@ function _get_property(v; data::Data)
         # datainfo
         datainfo = v.datainfo
         if datainfo === nothing
-            datainfo = get(data.columns, field, nothing)
+            datainfo = get(data.columns, fieldname, nothing)
             if datainfo === nothing
                 error("no DataInfo for column $(repr(field))")
             end
@@ -324,7 +334,10 @@ function _get_property(v; data::Data)
         datatype = datainfo.datatype
         factors = datainfo.factors
         nfactors = length(factors)
-        label = datainfo.label
+        label = v.label
+        if label === nothing
+            label = datainfo.label
+        end
         # transforms
         transforms = copy(v.transforms)
         if v.type == DATA_MAP
@@ -354,19 +367,17 @@ function _get_property(v; data::Data)
         end
         # done
         if length(transforms) == 0
-            literal = Bokeh.Field(field)
+            value = Bokeh.Field(fieldname)
         elseif length(transforms) == 1
-            literal = Bokeh.transform(field, transforms[1])
+            value = Bokeh.transform(fieldname, transforms[1])
         else
             # TODO: https://stackoverflow.com/questions/48772907/layering-or-nesting-multiple-bokeh-transforms
             error("not implemented: multiple transforms (on mapping $(v.name))")
         end
+        return ResolvedProperty(; orig=v, value, label, field, fieldname, datainfo)
     else
-        label = nothing
-        fields = nothing
-        literal = v
+        return ResolvedProperty(; orig=v, value=v)
     end
-    return (; literal, label, fields)
 end
 
 const PROPERTY_ALIASES = Dict(
@@ -374,23 +385,32 @@ const PROPERTY_ALIASES = Dict(
     :y => [:ys, :top],
 )
 
-function _get_label(labels, fieldnames, keys)
-    list = Any[label for key in keys for label in get(labels, key, [])]
-    if !isempty(list)
-        return first(list)
+function _get_label(layers, keys)
+    props = Any[v for layer in layers for (k, v) in layer.props if k in keys]
+    labels = Any[p.label for p in props if p.label !== nothing]
+    if !isempty(labels)
+        return first(labels)
     end
-    list = Any[label for key in keys for label in get(fieldnames, key, [])]
-    if !isempty(list)
-        return string(first(list))
+    labels = String[string(p.field.names) for p in props if p.field !== nothing]
+    if !isempty(labels)
+        return join(sort(unique(labels)), " / ")
     end
     return nothing
 end
 
+@kwdef struct ResolvedLayer
+    orig::Layer
+    data::Data
+    props::Dict{Symbol,ResolvedProperty}
+    renderer::Bokeh.ModelInstance
+end
+
 function draw(layers::Layers)
     fig = Bokeh.figure()
+
+    # PLOT/RESOLVE EACH LAYER
     source_cache = Dict{Any,Bokeh.ModelInstance}()
-    labels = Dict{Symbol,Vector{Any}}()
-    fieldnames = Dict{Symbol,Vector{Any}}()
+    resolved = Vector{ResolvedLayer}()
     for layer in layers.layers
         # get the data
         orig_data = layer.data
@@ -418,19 +438,53 @@ function draw(layers::Layers)
             end
         end
         # resolve the properties
-        kw = Dict{Symbol,Any}()
-        for (k, v) in props
-            x = _get_property(v; data)
-            kw[k] = x.literal
-            x.label !== nothing && push!(get!(Vector{Any}, labels, k), x.label)
-            x.fields !== nothing && push!(get!(Vector{Any}, fieldnames, k), x.fields)
-        end
+        props = Dict{Symbol,ResolvedProperty}(k => _get_property(v; data) for (k, v) in props)
         # plot the glyph
-        Bokeh.plot!(fig, glyph; source, kw...)
+        kw = Dict{Symbol,Any}(k => v.value for (k, v) in props)
+        renderer = Bokeh.plot!(fig, glyph; source, kw...)
+        # save
+        push!(resolved, ResolvedLayer(; orig=layer, data, props, renderer))
     end
-    # axis labels
-    fig.x_axis.axis_label = _get_label(labels, fieldnames, [:x, :xs, :right, :left])
-    fig.y_axis.axis_label = _get_label(labels, fieldnames, [:y, :ys, :top, :bottom])
+
+    # AXIS LABELS
+    fig.x_axis.axis_label = _get_label(resolved, [:x, :xs, :right, :left])
+    fig.y_axis.axis_label = _get_label(resolved, [:y, :ys, :top, :bottom])
+
+    # LEGENDS
+    # Find all layers+props for categorical mappings.
+    legendinfos = Dict()
+    for layer in resolved
+        for (k, v) in layer.props
+            v.datainfo !== nothing || continue
+            v.datainfo.datatype == FACTOR_DATA || continue
+            m = v.orig
+            m isa Mapping || continue
+            m.type in (COLOR_MAP, MARKER_MAP, HATCH_PATTERN_MAP) || continue
+            push!(get!(legendinfos, (layer.data.source, v.fieldname), []), (layer, v))
+        end
+    end
+    # Generate a legend for each unique source+field combination.
+    legends = []
+    for ((source, fieldname), layerprops) in legendinfos
+        item = Bokeh.LegendItem(; label=Bokeh.Field(fieldname), renderers=[layer.renderer for (layer, _) in layerprops])
+        items = [item]
+        titles = [p.label for (_, p) in layerprops if p.label !== nothing]
+        if !isempty(titles)
+            title = titles[1]
+        else
+            title = fieldname
+        end
+        legend = Bokeh.Legend(; items, title)
+        push!(legends, (fieldname, legend))
+    end
+    # Plot the legends, sorted by title.
+    sort!(legends, by=x->x[1])
+    for (_, legend) in legends
+        Bokeh.plot!(fig, legend, location="right")
+    end
+
+    # TODO: COLOR BARS
+
     return fig
 end
 
