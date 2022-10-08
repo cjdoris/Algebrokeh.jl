@@ -1,5 +1,7 @@
 # Algebrokeh.jl
 
+**NOTE: This repo has been moved into the main [Bokeh.jl](https://github.com/cjdoris/Bokeh.jl) repo.**
+
 A [AlgebraOfGraphics.jl](https://github.com/MakieOrg/AlgebraOfGraphics.jl)-style interface
 to [Bokeh.jl](https://github.com/cjdoris/Bokeh.jl).
 
